@@ -5,13 +5,20 @@
 #
 # Uso rápido:
 #   ./pve-ct-io-limit.sh 122 50
+#   ./pve-ct-io-limit.sh --all 50
+#   ./pve-ct-io-limit.sh --without-limits 122
+#   ./pve-ct-io-limit.sh --all --without-limits
 #
 # Comandos:
 #   ./pve-ct-io-limit.sh set CTID MBPS
 #   ./pve-ct-io-limit.sh set CTID READ_MBPS WRITE_MBPS
+#   ./pve-ct-io-limit.sh --all MBPS
+#   ./pve-ct-io-limit.sh --all READ_MBPS WRITE_MBPS
 #   ./pve-ct-io-limit.sh status CTID
 #   ./pve-ct-io-limit.sh refresh CTID
 #   ./pve-ct-io-limit.sh remove CTID
+#   ./pve-ct-io-limit.sh --without-limits CTID
+#   ./pve-ct-io-limit.sh --all --without-limits
 #
 # MBPS é interpretado como MiB/s: 1 MiB = 1024 * 1024 bytes.
 #
@@ -36,24 +43,36 @@ die() {
 
 usage() {
     cat <<EOF
-Uso:
+Uso em um CT:
   $SCRIPT_NAME CTID MBPS
   $SCRIPT_NAME set CTID MBPS
   $SCRIPT_NAME set CTID READ_MBPS WRITE_MBPS
   $SCRIPT_NAME status CTID
   $SCRIPT_NAME refresh CTID
   $SCRIPT_NAME remove CTID
+  $SCRIPT_NAME --without-limits CTID
+
+Uso em todos os CTs:
+  $SCRIPT_NAME --all MBPS
+  $SCRIPT_NAME --all READ_MBPS WRITE_MBPS
+  $SCRIPT_NAME --all --without-limits
+  $SCRIPT_NAME --without-limits --all
 
 Exemplos:
   $SCRIPT_NAME 122 50
-  $SCRIPT_NAME set 122 50
   $SCRIPT_NAME set 122 100 50
-  $SCRIPT_NAME status 122
-  $SCRIPT_NAME remove 122
+  $SCRIPT_NAME --all 50
+  $SCRIPT_NAME --all 100 50
+  $SCRIPT_NAME --without-limits 122
+  $SCRIPT_NAME --all --without-limits
 
 Observações:
   - Execute no host Proxmox como root.
   - 50 significa 50 MiB/s para leitura e 50 MiB/s para escrita.
+  - --all inclui todos os arquivos /etc/pve/lxc/*.conf, inclusive CTs parados.
+  - Em CT parado, a configuração fica persistente e entra em vigor ao iniciar.
+  - Operações com --all são sequenciais e continuam mesmo se um CT falhar.
+  - --without-limits remove somente o bloco gerenciado por este script.
   - O limite é aplicado por dispositivo. Se o CT usar discos em dispositivos
     diferentes, cada dispositivo receberá o limite informado.
   - Volumes ZFS/Ceph que não aparecem como dispositivo de bloco podem não ser
@@ -77,6 +96,25 @@ validate_ctid() {
     [[ "$ctid" =~ ^[0-9]+$ ]] || die "CTID inválido: $ctid"
     [[ -f "/etc/pve/lxc/${ctid}.conf" ]] || die "CT $ctid não encontrado em /etc/pve/lxc."
 }
+
+list_all_ctids() (
+    local conf filename ctid
+    local -a ctids=()
+
+    shopt -s nullglob
+
+    for conf in /etc/pve/lxc/*.conf; do
+        filename="${conf##*/}"
+        ctid="${filename%.conf}"
+
+        if [[ "$ctid" =~ ^[0-9]+$ ]]; then
+            ctids+=("$ctid")
+        fi
+    done
+
+    ((${#ctids[@]} > 0)) || return 1
+    printf '%s\n' "${ctids[@]}" | sort -n
+)
 
 validate_rate() {
     local value="$1"
@@ -322,6 +360,11 @@ remove_config_block() {
     local conf="/etc/pve/lxc/${ctid}.conf"
     local temp backup
 
+    if ! grep -Fq "$BEGIN_MARKER" "$conf"; then
+        info "nenhum limite persistente gerenciado pelo script no CT $ctid."
+        return 0
+    fi
+
     temp="$(mktemp)"
     backup="/root/${ctid}.conf.$(date +%Y%m%d-%H%M%S).bak"
     trap 'rm -f "${temp:-}"' RETURN
@@ -518,6 +561,70 @@ remove_limit() {
     info "concluído."
 }
 
+set_all_limits() {
+    local read_mib="$1"
+    local write_mib="$2"
+    local ctid
+    local success=0
+    local failed=0
+    local -a ctids=()
+
+    validate_rate "$read_mib"
+    validate_rate "$write_mib"
+
+    mapfile -t ctids < <(list_all_ctids) ||
+        die "nenhum CT encontrado em /etc/pve/lxc."
+
+    info "aplicando limite em ${#ctids[@]} CT(s)."
+    info "leitura: ${read_mib} MiB/s; escrita: ${write_mib} MiB/s."
+
+    for ctid in "${ctids[@]}"; do
+        printf '\n===== CT %s =====\n' "$ctid"
+
+        if (set_limit "$ctid" "$read_mib" "$write_mib"); then
+            ((++success))
+        else
+            ((++failed))
+            warn "falha ao aplicar limite no CT $ctid; continuando."
+        fi
+    done
+
+    printf '\n===== RESUMO =====\n'
+    printf 'Sucesso: %d\n' "$success"
+    printf 'Falha:   %d\n' "$failed"
+
+    ((failed == 0))
+}
+
+remove_all_limits() {
+    local ctid
+    local success=0
+    local failed=0
+    local -a ctids=()
+
+    mapfile -t ctids < <(list_all_ctids) ||
+        die "nenhum CT encontrado em /etc/pve/lxc."
+
+    info "removendo os limites gerenciados pelo script de ${#ctids[@]} CT(s)."
+
+    for ctid in "${ctids[@]}"; do
+        printf '\n===== CT %s =====\n' "$ctid"
+
+        if (remove_limit "$ctid"); then
+            ((++success))
+        else
+            ((++failed))
+            warn "falha ao remover limite do CT $ctid; continuando."
+        fi
+    done
+
+    printf '\n===== RESUMO =====\n'
+    printf 'Sucesso: %d\n' "$success"
+    printf 'Falha:   %d\n' "$failed"
+
+    ((failed == 0))
+}
+
 main() {
     require_root
     require_commands
@@ -533,6 +640,28 @@ main() {
     }
 
     case "$1" in
+        --all)
+            if [[ $# -eq 2 && "$2" == "--without-limits" ]]; then
+                remove_all_limits
+            elif [[ $# -eq 2 ]]; then
+                set_all_limits "$2" "$2"
+            elif [[ $# -eq 3 ]]; then
+                set_all_limits "$2" "$3"
+            else
+                usage
+                exit 1
+            fi
+            ;;
+        --without-limits)
+            if [[ $# -eq 2 && "$2" == "--all" ]]; then
+                remove_all_limits
+            elif [[ $# -eq 2 ]]; then
+                remove_limit "$2"
+            else
+                usage
+                exit 1
+            fi
+            ;;
         set)
             if [[ $# -eq 3 ]]; then
                 set_limit "$2" "$3" "$3"
